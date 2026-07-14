@@ -1,0 +1,35 @@
+# Daily information scraper configuration.
+#
+# Each source under `sources:` is a pluggable module (see src/sources/).
+# Add a source = add a module + add a config block here. A failed source is
+# logged and skipped, it never breaks the whole run.
+
+# Global settings
+max_items_per_source: 15   # cap items kept per source (newest first)
+max_push_items: 20        # cap items pushed to WeChat (length limits)
+timezone_offset: 8        # hours from UTC, used to label the digest date
+
+sources:
+  # ---------- arXiv papers ----------
+  # Official API: http://export.arxiv.org/api/query  (Atom XML, very stable)
+  # Categories: cs.AI (AI), cs.CL (NLP), cs.LG (ML), stat.ML, etc.
+  # Full taxonomy: https://arxiv.org/category_taxonomy
+  arxiv:
+    enabled: true
+    categories:
+      - cs.AI
+      - cs.CL
+      - cs.LG
+    max_results: 15        # per category, newest first
+
+  # ---------- Hacker News ----------
+  # Official RSS on news.ycombinator.com (reliable; the hnrss.org search
+  # wrapper is blocked from some networks). Available feeds:
+  #   frontpage - top front-page stories (general tech/news)
+  #   show      - "Show HN" project showcases
+  hackernews:
+    enabled: true
+    feeds:
+      - frontpage
+      - show
+    max_items: 15          # per feed, newest first
