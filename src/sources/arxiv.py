@@ -23,6 +23,9 @@ from .base import BaseSource
 # category, and run once a day, so this is well within limits.
 _API_URL = "http://export.arxiv.org/api/query"
 _HEADERS = {"User-Agent": "info-scraper/1.0 (daily digest; mailto:none)"}
+# Search returns more results than subscription (full keyword search, not just
+# the latest N per category). Capped to stay well under API rate limits.
+_SEARCH_MAX = 100
 
 
 def _parse_published(entry) -> datetime:
@@ -37,12 +40,58 @@ def _parse_published(entry) -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _entry_to_item(entry, source_name: str, category: str) -> InfoItem | None:
+    """Convert one arXiv Atom entry to an InfoItem, or None if unusable."""
+    url = getattr(entry, "link", "") or ""
+    if not url:
+        return None
+    # arXiv abstracts carry LaTeX/math; keep raw - rendering is the consumer's
+    # job.
+    return InfoItem(
+        title=(getattr(entry, "title", "") or "").strip().replace("\n", " "),
+        url=url,
+        summary=(getattr(entry, "summary", "") or "").strip(),
+        published=_parse_published(entry),
+        source_name=source_name,
+        source_category=category,
+    )
+
+
 class ArxivSource(BaseSource):
     name = "arxiv"
     display_name = "arXiv 论文"
     emoji = "📚"
 
+    def _query(self, search_query: str, max_results: int,
+               sort_by: str, category: str) -> List[InfoItem]:
+        """Run one arXiv API query and return parsed items. Never raises."""
+        try:
+            params = {
+                "search_query": search_query,
+                "start": 0,
+                "max_results": max_results,
+                "sortBy": sort_by,
+                "sortOrder": "descending",
+            }
+            resp = requests.get(_API_URL, params=params,
+                                headers=_HEADERS, timeout=30)
+            resp.raise_for_status()
+            parsed = feedparser.parse(resp.text)
+            if not parsed.entries:
+                return []
+            items: List[InfoItem] = []
+            for entry in parsed.entries[:max_results]:
+                item = _entry_to_item(entry, self.name, category)
+                if item is not None:
+                    items.append(item)
+            return items
+        except Exception as e:
+            print(f"[warn] arxiv query failed ({search_query}): {e}",
+                  file=sys.stderr)
+            return []
+
     def fetch(self, config: dict) -> List[InfoItem]:
+        """Subscription mode: latest papers per configured category."""
         categories: List[str] = config.get("categories", [])
         max_results: int = int(config.get("max_results", 15))
         if not categories:
@@ -51,42 +100,34 @@ class ArxivSource(BaseSource):
 
         items: List[InfoItem] = []
         for category in categories:
-            try:
-                query = f"cat:{category}"
-                params = {
-                    "search_query": query,
-                    "start": 0,
-                    "max_results": max_results,
-                    "sortBy": "submittedDate",
-                    "sortOrder": "descending",
-                }
-                resp = requests.get(_API_URL, params=params,
-                                    headers=_HEADERS, timeout=30)
-                resp.raise_for_status()
-                parsed = feedparser.parse(resp.text)
-                if not parsed.entries:
-                    print(f"[warn] arxiv cat={category}: no entries",
-                          file=sys.stderr)
-                    continue
-                for entry in parsed.entries[:max_results]:
-                    url = getattr(entry, "link", "") or ""
-                    if not url:
-                        continue
-                    # arXiv abstracts carry LaTeX/math; keep raw - rendering is
-                    # the consumer's job.
-                    items.append(InfoItem(
-                        title=(getattr(entry, "title", "") or "").strip()
-                              .replace("\n", " "),
-                        url=url,
-                        summary=(getattr(entry, "summary", "") or "").strip(),
-                        published=_parse_published(entry),
-                        source_name=self.name,
-                        source_category=category,
-                    ))
-                print(f"[info] arxiv cat={category}: "
-                      f"{len(parsed.entries[:max_results])} entries",
-                      file=sys.stderr)
-            except Exception as e:
-                print(f"[warn] arxiv cat={category} failed: {e}",
-                      file=sys.stderr)
+            found = self._query(
+                search_query=f"cat:{category}",
+                max_results=max_results,
+                sort_by="submittedDate",
+                category=category,
+            )
+            print(f"[info] arxiv cat={category}: {len(found)} entries",
+                  file=sys.stderr)
+            items.extend(found)
         return items
+
+    def search(self, config: dict, query: str) -> List[InfoItem]:
+        """Search mode: full-text keyword search across all arXiv.
+
+        Searches ALL arXiv (not just configured categories) so the user finds
+        papers regardless of their category. Sorted by relevance so keyword
+        matches surface first.
+        """
+        query = (query or "").strip()
+        if not query:
+            return []
+        # arXiv `all:` searches title+abstract+comments across every category.
+        found = self._query(
+            search_query=f"all:{query}",
+            max_results=_SEARCH_MAX,
+            sort_by="relevance",
+            category=f"search: {query}",
+        )
+        print(f"[info] arxiv search '{query}': {len(found)} entries",
+              file=sys.stderr)
+        return found

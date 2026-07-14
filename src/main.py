@@ -1,15 +1,19 @@
-"""Daily information scraper entry point.
+"""Information scraper entry point.
 
-Discovers all source modules, fetches each enabled one, merges results into a
-single Markdown digest saved to digests/YYYY-MM-DD.md, and optionally pushes a
-summary to WeChat (PushPlus / Server酱 / 企业微信 / 钉钉).
+Two modes:
+  - Subscription (default): `python -m src.main`
+    Fetch latest items from each enabled source, archive to
+    digests/YYYY-MM-DD.md, push a summary to WeChat.
+  - Search: `python -m src.main --search QUERY`
+    Full-text keyword search across sources (arXiv, ...), archive to
+    digests/search-{QUERY}-{YYYY-MM-DD}.md, push the top results to WeChat.
 
-Run locally:
-    pip install -r requirements.txt
-    python -m src.main
+GitHub Actions: the workflow_dispatch `search` input maps to --search, so a
+manual run with a keyword triggers search mode.
 """
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 from collections import defaultdict
@@ -25,12 +29,19 @@ from .sources import discover_sources
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
+# keep alphanumerics, CJK, underscore, hyphen; replace the rest with '_'
+_SAFE_FN_RE = re.compile(r"[^a-zA-Z0-9一-鿿_-]")
 
 
 def _strip_html(text: str) -> str:
     text = _TAG_RE.sub("", text)
     text = unescape(text)
     return _WS_RE.sub(" ", text).strip()
+
+
+def _safe_filename_part(query: str) -> str:
+    """Make a query safe for use in a digest filename."""
+    return _SAFE_FN_RE.sub("_", query).strip("_")[:30] or "query"
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -53,14 +64,15 @@ def _group_by_source(items: list[InfoItem]):
 
 
 def generate_markdown(items: list[InfoItem], today: date,
-                      source_meta: dict) -> str:
+                      source_meta: dict, search_query: str = "") -> str:
     """Render the full Markdown digest, grouped by source then category."""
-    lines = [
-        f"# 每日信息摘要 - {today.isoformat()}",
-        "",
-        f"> 共收录 {len(items)} 条，按数据源分类，时间倒序。",
-        "",
-    ]
+    if search_query:
+        title = f"# 搜索「{search_query}」- {today.isoformat()}"
+        intro = f"> 共找到 {len(items)} 条结果，按数据源分类。"
+    else:
+        title = f"# 每日信息摘要 - {today.isoformat()}"
+        intro = f"> 共收录 {len(items)} 条，按数据源分类，时间倒序。"
+    lines = [title, "", intro, ""]
     grouped = _group_by_source(items)
     for source_name in sorted(grouped.keys()):
         meta = source_meta.get(source_name, {})
@@ -90,9 +102,13 @@ def generate_markdown(items: list[InfoItem], today: date,
 
 
 def generate_webhook_message(items: list[InfoItem], today: date,
-                             max_items: int, source_meta: dict) -> str:
+                             max_items: int, source_meta: dict,
+                             search_query: str = "") -> str:
     """Compact message for WeChat push (kept short for size limits)."""
-    lines = [f"## 每日信息摘要 {today.isoformat()}", ""]
+    if search_query:
+        lines = [f"## 搜索「{search_query}」结果（{len(items)} 条）", ""]
+    else:
+        lines = [f"## 每日信息摘要 {today.isoformat()}", ""]
     grouped = _group_by_source(items)
     pushed = 0
     for source_name in sorted(grouped.keys()):
@@ -105,7 +121,10 @@ def generate_webhook_message(items: list[InfoItem], today: date,
         src_items = []
         for cat_items in grouped[source_name].values():
             src_items.extend(cat_items)
-        src_items.sort(key=lambda x: x.published, reverse=True)
+        # search mode preserves source ordering (relevance); subscription
+        # mode sorts newest-first.
+        if not search_query:
+            src_items.sort(key=lambda x: x.published, reverse=True)
         lines.append(f"{emoji} {display}")
         for it in src_items:
             if pushed >= max_items:
@@ -117,13 +136,27 @@ def generate_webhook_message(items: list[InfoItem], today: date,
     if len(items) > pushed:
         lines.append(f"- ...及另外 {len(items) - pushed} 条")
         lines.append("")
-    lines.append(f"> 完整列表见仓库 `digests/{today.isoformat()}.md`")
+    if search_query:
+        fn = f"search-{_safe_filename_part(search_query)}-{today.isoformat()}.md"
+        lines.append(f"> 完整列表见仓库 `digests/{fn}`")
+    else:
+        lines.append(f"> 完整列表见仓库 `digests/{today.isoformat()}.md`")
     return "\n".join(lines)
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Information scraper")
+    parser.add_argument("--search", type=str, default="",
+                        help="keyword search (empty = subscription mode)")
+    args = parser.parse_args()
+    search_query = (args.search or "").strip()
+
     config = Config.from_file(CONFIG_PATH)
     registry = discover_sources()
+    mode = "search" if search_query else "subscription"
+    print(f"[info] mode: {mode}"
+          + (f" | query='{search_query}'" if search_query else ""),
+          file=sys.stderr)
     print(f"[info] registered sources: {list(registry)}", file=sys.stderr)
 
     all_items: list[InfoItem] = []
@@ -142,17 +175,23 @@ def main() -> int:
             "display_name": getattr(source, "display_name", source_name),
             "emoji": getattr(source, "emoji", ""),
         }
-        print(f"[info] fetching source '{source_name}'...", file=sys.stderr)
-        items = source.fetch(config.sources[source_name])
-        # cap PER source_category (e.g. each arxiv category, each HN feed),
-        # not per source total - so adding categories never starves the others.
-        cap = config.max_items_per_source
-        by_cat: dict[str, list[InfoItem]] = defaultdict(list)
-        for it in items:
-            by_cat[it.source_category].append(it)
-        items = [it for cat_items in by_cat.values() for it in cat_items[:cap]]
-        print(f"[info] source '{source_name}': {len(items)} items "
-              f"(cap {cap}/category, {len(by_cat)} categories)",
+        src_config = config.sources[source_name]
+        if search_query:
+            print(f"[info] searching source '{source_name}' "
+                  f"for '{search_query}'...", file=sys.stderr)
+            items = source.search(src_config, search_query)
+        else:
+            print(f"[info] fetching source '{source_name}'...", file=sys.stderr)
+            items = source.fetch(src_config)
+            # cap PER source_category (e.g. each arxiv category, each HN feed),
+            # not per source total - so adding categories never starves others.
+            cap = config.max_items_per_source
+            by_cat: dict[str, list[InfoItem]] = defaultdict(list)
+            for it in items:
+                by_cat[it.source_category].append(it)
+            items = [it for cat_items in by_cat.values()
+                     for it in cat_items[:cap]]
+        print(f"[info] source '{source_name}': {len(items)} items",
               file=sys.stderr)
         all_items.extend(items)
 
@@ -170,10 +209,17 @@ def main() -> int:
         unique.append(it)
 
     today = _today(config.timezone_offset)
-    markdown = generate_markdown(unique, today, source_meta)
+    markdown = generate_markdown(unique, today, source_meta, search_query)
 
     DIGESTS_DIR.mkdir(exist_ok=True)
-    output_path = DIGESTS_DIR / f"{today.isoformat()}.md"
+    if search_query:
+        out_name = f"search-{_safe_filename_part(search_query)}-" \
+                   f"{today.isoformat()}.md"
+        push_title = f"搜索「{search_query}」结果（{len(unique)} 条）"
+    else:
+        out_name = f"{today.isoformat()}.md"
+        push_title = f"每日信息摘要 {today.isoformat()}"
+    output_path = DIGESTS_DIR / out_name
     output_path.write_text(markdown, encoding="utf-8")
     print(f"[info] digest written to {output_path} "
           f"({len(unique)} items)", file=sys.stderr)
@@ -181,14 +227,13 @@ def main() -> int:
     webhook_url = os.environ.get("WEBHOOK_URL", "").strip()
     if webhook_url:
         msg = generate_webhook_message(unique, today, config.max_push_items,
-                                       source_meta)
-        notify(webhook_url, msg, f"每日信息摘要 {today.isoformat()}")
+                                       source_meta, search_query)
+        notify(webhook_url, msg, push_title)
     else:
         print("[info] WEBHOOK_URL not set, skipping notification",
               file=sys.stderr)
 
-    print(f"::notice::Daily info digest generated: "
-          f"{today.isoformat()} ({len(unique)} items)")
+    print(f"::notice::Digest generated: {out_name} ({len(unique)} items)")
     return 0
 
 

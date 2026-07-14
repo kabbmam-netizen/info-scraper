@@ -20,7 +20,17 @@ class BaseSource:
     def fetch(self, config: dict) -> List[InfoItem]:
         """Fetch items for this source. `config` is its config.yml block.
 
-        Must be self-contained: log warnings to stderr and return [] on any
-        failure (network, parse, empty). Never raise.
+        Subscription mode: return the latest items. Must be self-contained:
+        log warnings to stderr and return [] on any failure (network, parse,
+        empty). Never raise.
         """
         raise NotImplementedError
+
+    def search(self, config: dict, query: str) -> List[InfoItem]:
+        """Keyword search across this source's full content.
+
+        Search mode (triggered via `python -m src.main --search QUERY`). The
+        default returns [] - sources that expose keyword search override this.
+        Same resilience rule as fetch(): never raise, return [] on failure.
+        """
+        return []
