@@ -196,6 +196,34 @@ def main() -> int:
         all_items.extend(items)
 
     if not all_items:
+        if search_query:
+            # Search succeeded but matched nothing - not a failure. Still
+            # write an empty-result digest and (optionally) notify, so the
+            # user gets feedback instead of a red X in Actions.
+            _CJ_RE = re.compile(r"[一-鿿]")
+            hint = ""
+            if _CJ_RE.search(search_query) and not search_query.isascii():
+                hint = ("arXiv 是英文论文库，中文关键词通常搜不到结果。"
+                        "建议改用英文检索词，如 'robot manipulation'、'SLAM'。")
+            today = _today(config.timezone_offset)
+            DIGESTS_DIR.mkdir(exist_ok=True)
+            out_name = (f"search-{_safe_filename_part(search_query)}-"
+                        f"{today.isoformat()}.md")
+            body = (f"# 搜索「{search_query}」- {today.isoformat()}\n\n"
+                    f"> 未找到匹配结果。\n")
+            if hint:
+                body += f"\n> {hint}\n"
+            (DIGESTS_DIR / out_name).write_text(body, encoding="utf-8")
+            print(f"[info] search '{search_query}': 0 matches -> "
+                  f"{out_name}", file=sys.stderr)
+            if hint:
+                print(f"[hint] {hint}", file=sys.stderr)
+            webhook_url = os.environ.get("WEBHOOK_URL", "").strip()
+            if webhook_url:
+                notify(webhook_url, hint or "未找到匹配结果。",
+                       f"搜索「{search_query}」：0 条结果")
+            print(f"::notice::Search '{search_query}' returned 0 matches")
+            return 0
         print("[error] no items collected from any source", file=sys.stderr)
         return 1
 
