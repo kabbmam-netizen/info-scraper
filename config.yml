@@ -33,3 +33,12 @@ sources:
       - frontpage
       - show
     max_items: 15          # per feed, newest first
+
+  # ---------- HuggingFace datasets ----------
+  # Public Hub API (JSON). Subscription lists trending datasets by `likes`
+  # (popularity) so personal test datasets don't drown out real ones. Search
+  # matches keywords and sorts by `downloads` (most-used first).
+  huggingface:
+    enabled: true
+    max_results: 15        # subscription: trending datasets
+    max_search_results: 30  # search mode: datasets matching a keyword
